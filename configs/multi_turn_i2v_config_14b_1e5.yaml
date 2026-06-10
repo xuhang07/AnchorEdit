@@ -1,0 +1,170 @@
+# Text Encoder Configuration  
+text_encoder:
+  type: "t5"
+  text_len: 512
+  t5_dtype: "bfloat16"
+  t5_fsdp: true
+  t5_cpu: false
+
+# VAE Configuration
+vae:
+  type: "wan_vae"
+  vae_stride: [4, 8, 8]
+  vae_dtype: "bfloat16"
+
+# Training Configuration
+training:
+  batch_size: 1
+  num_workers: 1
+  max_steps: 100000
+  log_interval: 1
+  save_interval: 100
+  gc_interval: 1000
+
+  # 梯度累计：实际有效 batch = batch_size * gradient_accumulation_steps * world_size
+  gradient_accumulation_steps: 4
+
+  # Optimization
+  lr: 1.0e-5
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.01
+  max_grad_norm_generator: 10.0
+  
+  # EMA
+  ema_weight: 0.0
+  
+  # Diffusion parameters
+  num_train_timesteps: 1000
+  min_step_ratio: 0.02
+  max_step_ratio: 0.98
+  guidance_scale: 7.5
+  negative_prompt: "low quality, blurry, distorted"
+  
+  # Mixed precision
+  mixed_precision: true
+  dtype: "bfloat16"
+  loss_type: "all"
+  is_tf: false
+
+  # ---- timestep 采样：区间内独立 uniform 采样 ----
+  # 每帧 t ratio ∈ [u_lower, u_upper(p_i)]：
+  #   - u_lower ∈ [first_frame_noise_min_ratio, first_frame_noise_max_ratio]：每样本一个，整段序列共享
+  #   - u_upper(p_i)：
+  #       monotonic_timestep=True  → 从 first_frame_noise_max_ratio 线性升到 u_last_max（causal 训练）
+  #       monotonic_timestep=False → 全帧共享 u_last_max（双向 self-attn 推荐）
+  #   - u_last_max ∈ [u_last_max_min_ratio, 1.0]：抬高末端下界，保证 mean_t 足够大
+  monotonic_timestep: false
+  first_frame_noise_min_ratio: 0.35
+  first_frame_noise_max_ratio: 0.55
+  u_last_max_min_ratio: 0.7
+
+  # 已不使用 jitter（区间采样已自带随机性）
+  timestep_jitter_scale: 0.0
+
+  # 兼容字段（已不起分支作用；num_frame_per_block=1 下等价）
+  same_timestep_across_sequence: false
+
+  # ---- Exposure bias / Scheduled sampling（开启）----
+  # 以该概率用模型自己一次 no_grad 前向得到的 pred_x0 替换中间历史帧的 latent。
+  # 0 即退化为原始 diffusion forcing；这里全开训练用 0.3 的中等强度。
+  # 双向 self-attn 下，每帧能看到全序列，不再需要 self-forcing 训推一致校准
+  self_forcing_prob: 0.0
+  # 前 N 步不开启 self-forcing，等模型有基本去噪能力再开；单位是 global step（按 train_step 计）。
+  # 当前 ckpt 已加载预训练权重，warmup 可以稍短。
+  self_forcing_warmup_steps: 500
+
+  # ---- Turn-weighted loss ----
+  # 每帧权重 w_i = 1 + alpha * p_i（p_i = (i-1)/(T-2) 对非首帧而言 0..1）。
+  # alpha=0.0 → 全 1，等价原始 mean MSE（双向 self-attn 推荐）
+  # alpha=1.0 → 末轮权重 2x，平滑提升后续轮次（causal 训练推荐）
+  turn_weight_alpha: 0.0
+
+  # 帧位退化（latent 域）：区间内独立 uniform 采样
+  # 每帧强度系数 s_i ~ Uniform(lower, upper(p_i))：
+  #   monotonic_degradation=True  → upper(p_i) = lower + (1-lower)*p_i（causal 训练推荐）
+  #   monotonic_degradation=False → 全帧共享 upper=1.0（双向 self-attn 推荐）
+  history_degradation:
+    enable: true
+    monotonic_degradation: false
+    # 每帧最低退化强度比例（固定下限）
+    degrade_lower_frac: 0.15
+    # 各退化方式的触发概率（按帧独立采样）
+    p_color:   0.2
+    p_lowfreq: 0.2
+    p_block:   0.1
+    p_laplace: 0.1
+    p_blur:    0.1
+    p_vae_rt:  0.1
+    # 强度上限（实际 per-frame 强度 = 上限 * s_i）
+    color_scale_eps: 0.05
+    color_bias_eps:  0.03
+    lowfreq_amp_max: 0.06
+    block_sizes: [2, 4]
+    laplace_b_max:   0.035
+    blur_sigma_max:  0.45
+    vae_rt_mix_max:  0.4
+
+# FSDP Configuration
+fsdp:
+  sharding_strategy: "full"
+  generator_fsdp_wrap_strategy: "size"
+  text_encoder_fsdp_wrap_strategy: "size"
+  text_encoder_cpu_offload: false
+
+# Data Configuration
+data:
+  data_path: "/path/to/your/multi_turn_data.json"
+  image_size: [1024,1024]
+  max_turns: 5
+  # (num_turns, h, w) 联合分桶参数
+  bucket_step_width: 64
+  bucket_step_height: 64
+  bucket_max_ratio: 4.0
+  
+# Distributed Training
+distributed:
+  backend: "nccl"
+  init_method: "env://"
+  
+# Logging Configuration
+logging:
+  logdir: "./logs/multi_turn_i2v_14b_1e5_bidir"
+  tensorboard_logdir: "./logs/multi_turn_i2v_14b_1e5_bidir/tensorboard"
+  ckpt_logdir: "./logs/multi_turn_i2v_14b_1e5_bidir/ckpt"
+  enable_tensorboard: true
+
+# System Configuration
+system:
+  seed: 42
+  device: "cuda"
+  num_gpus: 8
+  compile: false  # PyTorch 2.0 compilation
+  
+# Checkpointing
+checkpoint:
+  generator_ckpt: /path/to/pretrained/stage1_checkpoint/model.pt  # Path to pretrained generator checkpoint
+  no_save: false
+  no_visualize: false
+
+model_kwargs:
+  model_name: /path/to/Wan2.1-T2V-14B
+  timestep_shift: 1.0
+  is_causal: true  # 使用因果模型进行AR生成
+  local_attn_size: -1
+  sink_size: 0
+  model_type: "t2v"
+  num_frame_per_block: 1  # Frames per transformer block
+  independent_first_frame: True
+  cross_attn_current_prompt_only: True
+  temporal_rope_stride: 4  # 相邻帧时序RoPE距离，>1使帧间变化更平滑
+  # self-attn 是否双向（所有帧互相可见）。
+  # True：双向 self-attn（仍保留 cross-attn 每帧只看自己 prompt 的设置）。
+  # False（默认）：blockwise causal self-attn，与原模型一致。
+  bidirectional_self_attn: True
+
+
+
+
+
+

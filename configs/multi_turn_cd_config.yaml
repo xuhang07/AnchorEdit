@@ -1,0 +1,143 @@
+# =============================================================================
+# Multi-Turn I2V Consistency Distillation Config
+#
+# 替代初版 ODE-init（configs/multi_turn_ode_init_config.yaml），用来为 DMD 蒸馏
+# （configs/multi_turn_dmd_distill_config.yaml）准备一个「会走少步路径」的初始化权重。
+#
+# 训练逻辑（与 trainer/multi_turn_cd.py 对应）：
+#   1. 取多轮 batch -> [B, T, C, H, W]
+#   2. 同步采目标 turn k ∈ [1, T-1]
+#   3. no_grad self-rollout history[1..k-1]，prefill KV cache 到 k-1
+#      （三份模型 generator / generator_ema / teacher 各一份 KV cache）
+#   4. 同步采 timestep_idx ∈ [0, N-1)，得到 (t, t_next)，dt = 1/N
+#   5. 对 GT clean_k 加噪到 t -> latent_t
+#   6. Teacher 单步 ODE（带 CFG）：latent_t_next = latent_t - dt * v_pred_teacher
+#   7. Student forward(带梯度) -> cm_pred_t
+#   8. EMA student forward(no_grad) -> cm_pred_t_next
+#   9. loss = MSE(cm_pred_t, cm_pred_t_next.detach())
+#  10. backward + update generator + update EMA
+#
+# 产出 ckpt 路径示例：
+#   logs/multi_turn_cd_14b/ckpt/checkpoint_002000/model.pt
+# 随后把这个路径填到 DMD config 的 checkpoint.pretrained_pt 即可。
+# =============================================================================
+
+# 训练 flags
+distribution_loss: "cd"
+i2v: false
+causal: true
+mixed_precision: true
+
+# ---- Consistency Distillation 核心超参 ----
+# teacher 单步 ODE 的密集网格步数，越大 teacher 误差越小，训练越稳
+discrete_cd_N: 48
+# teacher 前向时的 classifier-free guidance scale
+teacher_guidance_scale: 3.0
+# CD scheduler 的 shift（与 Wan 默认 flow matching shift 对齐）
+cd_scheduler_shift: 5.0
+# student EMA 衰减；CD 必须开 EMA，否则没有稳定目标
+ema_decay: 0.999
+# EMA 权重（用于最终 save_checkpoint，和 ema_decay 保持一致；DMD 那边读它）
+ema_weight: 0.999
+
+# student 少步推理（仅用于 self-rollout history，训练 loss 不依赖它）
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: false
+
+# Scheduler
+num_train_timestep: 1000
+timestep_shift: 5.0
+
+# AR 回写 KV cache 时给 history latent 的 timestep（与 DMD 一致）
+context_noise: 0
+same_step_across_blocks: true
+
+# Generator 架构相关（保持和多轮训练 / DMD 完全一致）
+num_frame_per_block: 1
+independent_first_frame: true
+gradient_checkpointing: true
+last_step_only: true
+num_training_frames: 21
+
+# Training schedule
+batch_size: 1
+gradient_accumulation_steps: 1
+num_workers: 1
+max_steps: 80000
+log_iters: 1
+save_iters: 500
+gc_interval: 50
+no_save: false
+no_visualize: true
+load_raw_video: false
+disable_wandb: true
+
+# Optim（CD 对 LR 比较敏感，和 ODE-init 同量级即可）
+lr: 5.0e-6
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+max_grad_norm_generator: 10.0
+
+# FSDP
+sharding_strategy: "full"
+generator_fsdp_wrap_strategy: "size"
+text_encoder_fsdp_wrap_strategy: "size"
+text_encoder_cpu_offload: true
+
+# CPU offload
+# - generator 参训，默认常驻 GPU
+# - generator_ema / teacher 只做 no_grad forward，默认 offload 到 CPU，用到时再上 GPU
+generator_cpu_offload: false
+generator_ema_cpu_offload: true
+teacher_cpu_offload: true
+vae_cpu_offload: true
+
+# Data（与多轮训练 / DMD 使用相同的多轮数据集）
+data:
+  data_path: "/path/to/your/multi_turn_data.json"
+  image_size: [1024, 1024]
+  max_turns: 5
+  # 严格模式：要求样本 num_turns == max_turns，与 DMD trainer 一致，
+  # 避免多 rank FSDP self-rollout 调用次数不齐。
+  require_exact_turns: true
+  bucket_step_width: 64
+  bucket_step_height: 64
+  bucket_max_ratio: 4.0
+
+# Logging
+config_name: "multi_turn_cd_14b"
+logdir: "./logs/multi_turn_cd_14b/ckpt"
+tensorboard_logdir: "./logs/multi_turn_cd_14b/tensorboard"
+enable_tensorboard: true
+
+# System
+seed: 42
+num_gpus: 8
+compile: false
+
+# Checkpoint
+checkpoint:
+  # 已经训练好的多轮 causal 编辑模型（CD 的 student/EMA/teacher 三者共同起点）
+  pretrained_pt: /path/to/stage2_checkpoint/model.pt
+  # 是否优先从 ckpt["generator_ema"] 加载（推理路径用的就是 EMA，teacher 以
+  # EMA 为起点质量更高，更有资格指导 student）。找不到 ema 时自动回落到 generator。
+  prefer_ema: true
+  # 单独覆盖 generator ckpt（可选，用于 resume；resume 时强制走实时权重）
+  generator_ckpt: null
+  rank0_only_load: true
+  no_save: false
+  no_visualize: true
+
+# Generator 模型参数（与多轮训练 / DMD 完全一致）
+model_kwargs:
+  model_name: /path/to/Wan2.1-T2V-14B
+  timestep_shift: 5.0
+  is_causal: true
+  local_attn_size: -1
+  sink_size: 0
+  model_type: "t2v"
+  num_frame_per_block: 1
+  independent_first_frame: true
+  cross_attn_current_prompt_only: true
+  temporal_rope_stride: 4

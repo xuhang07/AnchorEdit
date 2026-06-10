@@ -1,0 +1,177 @@
+# =============================================================================
+# Multi-Turn I2V DMD Distillation Config
+# 把已经训练好的多轮 causal 编辑模型蒸馏成少步（默认 4 步）模型。
+#
+# 关键设计（与 trainer/multi_turn_dmd.py 配套）：
+#   - generator / real_score / fake_score 都是 causal 多轮模型，初始化用同一份
+#     pretrained ckpt（由 checkpoint.pretrained_pt 指定）。
+#   - 每个 micro-step:
+#       1. 取一条多轮 batch -> [B, T, C, H, W]，T = 1 + N_turns
+#       2. 同步采样目标 turn k ∈ [1, T-1]
+#       3. no_grad self-rollout 出 history_pred[:, 1:k]，并把 k 之前的内容
+#          写入 generator 的 KV cache
+#       4. 在 k 位置采样一个 denoising step idx s，做 backward simulation 拿到
+#          noisy_input_k，单步 forward generator -> pred_x0_k（带梯度）
+#       5. real/fake score 不带 KV cache，整段 causal forward；只在第 k 帧
+#          加噪 + 计算 DMD grad（前面帧 t=0，后面帧 t=0 仅占位）
+# =============================================================================
+
+# Distillation flags
+distribution_loss: "dmd"
+i2v: false
+causal: true
+mixed_precision: true
+
+# DMD 少步 schedule（与原版一致：1000 -> 250，4 步）
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: false
+
+# Loss / scheduler
+num_train_timestep: 1000
+timestep_shift: 1.0
+real_guidance_scale: 6.0
+fake_guidance_scale: 0.0
+ts_schedule: false
+ts_schedule_max: false
+min_score_timestep: 0
+denoising_loss_type: "flow"
+
+# generator 训练时的少步采样区间（在 [min_step, max_step] 内 uniform）
+min_step_ratio: 0.02
+max_step_ratio: 0.98
+
+# Self-rollout 控制
+backward_simulation: true       # generator 单步训练用 backward simulation 构造输入
+self_rollout_no_grad: true      # history（< k turn）一律 no_grad self-rollout
+context_noise: 0                # AR 写回 KV cache 时给 history latent 的 timestep
+same_step_across_blocks: true
+
+# ----- 纯蒸馏（GT-free）控制 -----
+# 第 k 帧 noisy 输入的来源：
+#   self_rollout_prob = 1.0 -> 完全从 pure noise 多步去噪到第 s 步（不依赖 GT 第 k 帧）
+#   self_rollout_prob = 0.0 -> 用 GT 第 k 帧 + add_noise（旧行为，会引入 GT 颜色分布，可能偏色）
+#   ∈ (0, 1) -> 按概率混合
+self_rollout_prob: 1.0
+# 第 k+1..T-1 帧（future）在 real/fake score 整段 forward 时的占位：
+#   true  -> 用 GT 占位（旧行为；模型 causal 时理论上不影响 k 帧，但 GT 分布泄漏风险仍在）
+#   false -> 用 zeros 占位（纯蒸馏，推荐）
+use_gt_future_frames: false
+
+# generator 架构相关（保持和 multi_turn_i2v_config_14b_1e5.yaml 一致）
+num_frame_per_block: 1
+independent_first_frame: true
+gradient_checkpointing: true
+last_step_only: true
+num_training_frames: 21         # DMD baseline 占位字段，多轮训练时按 batch 实际 T 走
+
+# Training schedule
+batch_size: 1
+gradient_accumulation_steps: 1
+num_workers: 1
+max_steps: 100000
+log_iters: 1
+save_iters: 100
+gc_interval: 1
+no_save: false
+no_visualize: true
+load_raw_video: false
+disable_wandb: true
+
+# Optim
+lr: 1.0e-6                # generator 学习率（蒸馏阶段普遍偏小）
+lr_critic: 5.0e-6         # fake_score 学习率（critic 学得快一点）
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
+
+# generator vs critic 更新比例：每 dfake_gen_update_ratio 步训练一次 generator，
+# 中间步全部训练 fake_score
+dfake_gen_update_ratio: 5
+
+# EMA（蒸馏阶段建议 0.0 起步，稳定后再开）
+ema_weight: 0.0
+ema_start_step: 0
+
+# Negative prompt（用于 real_score CFG）
+negative_prompt: "low quality, blurry, distorted"
+
+# FSDP
+sharding_strategy: "full"
+generator_fsdp_wrap_strategy: "size"
+real_score_fsdp_wrap_strategy: "size"
+fake_score_fsdp_wrap_strategy: "size"
+text_encoder_fsdp_wrap_strategy: "size"
+text_encoder_cpu_offload: false
+
+text_encoder_cpu_offload: true
+vae_cpu_offload: true
+real_score_cpu_offload: true
+fake_score_cpu_offload: false
+generator_cpu_offload: true
+
+# Data（与多轮训练一致）
+data:
+  data_path: "/path/to/your/multi_turn_data.json"
+  image_size: [1024, 1024]
+  max_turns: 5
+  # 严格模式：要求样本 num_turns == max_turns，短样本直接丢弃。
+  # 这样所有 rank 拿到的 T = max_turns + 1 完全一致，避免 FSDP 多 rank
+  # 训练时 k 越界 / 集合通信对齐问题。
+  require_exact_turns: true
+  bucket_step_width: 64
+  bucket_step_height: 64
+  bucket_max_ratio: 4.0
+
+# Logging
+config_name: "multi_turn_dmd_4step_14b"
+logdir: "./logs/multi_turn_dmd_4step_14b/ckpt"
+tensorboard_logdir: "./logs/multi_turn_dmd_4step_14b/tensorboard"
+enable_tensorboard: true
+
+# System
+seed: 42
+num_gpus: 8
+compile: false
+
+# Checkpoint
+checkpoint:
+  # 已经训练好的多轮 causal 编辑模型（generator / real_score / fake_score 三者
+  # 共同初始化用这一份）
+  pretrained_pt: /path/to/stage2_checkpoint/model.pt
+  # 是否优先从 ckpt["generator_ema"] 加载（推理路径就是 EMA，DMD 三份模型
+  # 都以 EMA 为起点，KL gradient 更贴近真实分布、更稳定）。找不到 ema 时
+  # 自动回落到 ckpt["generator"]。
+  prefer_ema: true
+  # 单独覆盖 generator / fake_score 的 ckpt（resume 用，强制走实时权重）
+  generator_ckpt: null
+  fake_score_ckpt: null
+  # 仅 rank0 加载 ckpt，其它 rank 由 FSDP `sync_module_states` 从 rank0 broadcast。
+  # 强烈推荐在多节点集群训练（cgroup 限制 RAM）时开启，可避免 OOMKilled (137)。
+  # 单机调试时若遇到 broadcast 兼容性问题可关掉。
+  rank0_only_load: true
+  no_save: false
+  no_visualize: true
+
+# wandb（disable_wandb=true 时实际不会用）
+wandb_host: ""
+wandb_key: ""
+wandb_entity: ""
+wandb_project: ""
+wandb_save_dir: "./logs/multi_turn_dmd_4step_14b/wandb"
+
+# generator 模型参数（与多轮训练完全一致；real/fake score 复用）
+model_kwargs:
+  model_name: /path/to/Wan2.1-T2V-14B
+  timestep_shift: 1.0
+  is_causal: true
+  local_attn_size: -1
+  sink_size: 0
+  model_type: "t2v"
+  num_frame_per_block: 1
+  independent_first_frame: true
+  cross_attn_current_prompt_only: true
+  temporal_rope_stride: 4
