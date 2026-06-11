@@ -1,6 +1,6 @@
 <p align="center">
 <h1 align="center">AnchorEdit</h1>
-<h3 align="center">Maintaining Temporal Consistency in Multi-turn Imting via Causal Memory</h3>
+<h3 align="center">Maintaining Temporal Consistency in Multi-turn Image Editing via Causal Memory</h3>
 </p>
 
 ---
